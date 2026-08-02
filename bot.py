@@ -65,8 +65,20 @@ def get_data(short_key: str) -> Optional[Dict[str, Any]]:
     return DATA_STORE.get(short_key)
 
 # -----------------------------------------------------------------------------
-# 3. PENPENCIL API HEADERS & RECURSIVE JSON PARSER
+# 3. HELPER IDENTIFIER & DATA EXTRACTION UTILS
 # -----------------------------------------------------------------------------
+def extract_clean_id(obj: Any) -> str:
+    """Safely extracts a clean string ID from string, dict, or nested object."""
+    if not obj:
+        return ""
+    if isinstance(obj, str):
+        return obj.strip()
+    if isinstance(obj, dict):
+        for k in ("_id", "id", "subjectId", "tagId", "topicId", "videoId"):
+            if obj.get(k):
+                return extract_clean_id(obj[k])
+    return str(obj).strip()
+
 PENPENCIL_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Origin": "https://www.pw.live",
@@ -76,7 +88,7 @@ PENPENCIL_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-def extract_list(data: Any, target_keys=("subjects", "batchSubject", "contents", "lectures", "topics", "data", "result", "items")) -> List[Dict[str, Any]]:
+def extract_list(data: Any, target_keys=("topics", "batchTopics", "subjectTopics", "chapters", "subjects", "batchSubject", "contents", "lectures", "notes", "dpp", "data", "result", "items")) -> List[Dict[str, Any]]:
     """
     Recursively inspects nested PenPencil API JSON structures and extracts array lists.
     """
@@ -85,7 +97,7 @@ def extract_list(data: Any, target_keys=("subjects", "batchSubject", "contents",
     if isinstance(data, list):
         return [item for item in data if isinstance(item, dict)]
     if isinstance(data, dict):
-        # 1. Direct match on preferred keys
+        # 1. Check preferred target keys
         for key in target_keys:
             val = data.get(key)
             if isinstance(val, list) and len(val) > 0:
@@ -95,12 +107,12 @@ def extract_list(data: Any, target_keys=("subjects", "batchSubject", "contents",
                 if sub_res:
                     return sub_res
 
-        # 2. Match any list value containing dicts
+        # 2. Match any array containing dicts
         for k, v in data.items():
             if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
                 return v
 
-        # 3. Recurse into nested dictionaries
+        # 3. Recurse into nested dicts
         for k, v in data.items():
             if isinstance(v, dict):
                 res = extract_list(v, target_keys)
@@ -143,31 +155,43 @@ async def fetch_batch_subjects(batch_id: str) -> List[Dict[str, Any]]:
     return extract_list(raw_response, target_keys=("subjects", "batchSubject", "data", "result"))
 
 async def fetch_subject_topics(batch_id: str, subject_id: str, page: int = 1) -> List[Dict[str, Any]]:
-    """Fetch topics/chapters for a subject using fallback endpoints."""
+    """Fetch topics/chapters for a subject using comprehensive fallback endpoints."""
     endpoints = [
+        f"https://api.penpencil.co/v2/batches/{batch_id}/subject/{subject_id}/topics?page={page}&limit=50",
         f"https://api.penpencil.co/v2/batches/{batch_id}/subject/{subject_id}/topics?page={page}",
-        f"https://api.penpencil.co/v3/batches/{batch_id}/subject/{subject_id}/topics",
+        f"https://devcoderz-player.vercel.app/api/topics?batchId={batch_id}&subjectId={subject_id}",
+        f"https://proxy.streamvideo.co.in/fetch/api.penpencil.co/v2/batches/{batch_id}/subject/{subject_id}/topics?page={page}",
+        f"https://api.penpencil.co/v3/batches/{batch_id}/subject/{subject_id}/topics?page={page}",
+        f"https://api.penpencil.co/v2/batches/subject/{subject_id}/topics?page={page}",
     ]
     raw_response = await fetch_api_with_fallbacks(endpoints)
-    return extract_list(raw_response, target_keys=("topics", "data", "result", "items"))
+    return extract_list(raw_response, target_keys=("topics", "batchTopics", "subjectTopics", "chapters", "data", "result", "items"))
 
 async def fetch_topic_contents(batch_id: str, subject_id: str, tag_id: str, content_type: str, page: int = 1) -> List[Dict[str, Any]]:
     """Fetch contents (videos, notes, dpp) for a given topic & content type."""
-    content_type_map = {
-        "videos": "videos",
-        "notes": "notes",
-        "dpp_notes": "dpp_notes",
-        "dpp_solutions": "dpp_solutions"
-    }
-    type_param = content_type_map.get(content_type, "videos")
+    type_param = "videos"
+    alt_param = "lectures"
+    
+    if content_type == "notes":
+        type_param = "notes"
+        alt_param = "notes"
+    elif content_type == "dpp_notes":
+        type_param = "DppNotes"
+        alt_param = "dpp_notes"
+    elif content_type == "dpp_solutions":
+        type_param = "DppVideos"
+        alt_param = "dpp_solutions"
 
     endpoints = [
         f"https://api.penpencil.co/v2/batches/{batch_id}/subject/{subject_id}/contents?tag={tag_id}&contentType={type_param}&page={page}",
+        f"https://api.penpencil.co/v2/batches/{batch_id}/subject/{subject_id}/contents?tag={tag_id}&contentType={alt_param}&page={page}",
+        f"https://devcoderz-player.vercel.app/api/lectures?batchId={batch_id}&subjectId={subject_id}&tag={tag_id}&contentType={type_param}",
+        f"https://proxy.streamvideo.co.in/fetch/api.penpencil.co/v2/batches/{batch_id}/subject/{subject_id}/contents?tag={tag_id}&contentType={type_param}&page={page}",
+        f"https://api.penpencil.co/v2/batches/{batch_id}/subject/{subject_id}/contents?contentType={type_param}&page={page}",
         f"https://api.penpencil.co/v3/batches/{batch_id}/subject/{subject_id}/contents?tag={tag_id}&contentType={type_param}",
-        f"https://api.penpencil.co/v2/batches/{batch_id}/subject/{subject_id}/contents?topicId={tag_id}&contentType={type_param}&page={page}",
     ]
     raw_response = await fetch_api_with_fallbacks(endpoints)
-    return extract_list(raw_response, target_keys=("contents", "lectures", "data", "result", "items"))
+    return extract_list(raw_response, target_keys=("contents", "lectures", "notes", "dpp", "data", "result", "items"))
 
 # -----------------------------------------------------------------------------
 # 5. COMMAND & MESSAGE HANDLERS
@@ -178,12 +202,10 @@ def clean_batch_id(raw_input: str) -> Optional[str]:
         return None
     text = raw_input.strip()
     
-    # Handle space-separated args like "/start 65a8c..." or "/batchid 65a8c..."
     parts = text.split()
     if len(parts) > 1:
         text = parts[1].strip()
 
-    # Clean out command prefixes
     text = re.sub(r'^[/#]+', '', text)
     text = re.sub(r'^batch_?', '', text, flags=re.IGNORECASE)
     text = text.strip()
@@ -260,13 +282,12 @@ async def process_batch_id(message_or_query, batch_id: str, is_edit: bool = Fals
 
     keyboard = []
     for subj in subjects:
-        subj_id = str(subj.get("_id") or subj.get("id") or subj.get("subjectId") or "")
+        subj_id = extract_clean_id(subj.get("_id") or subj.get("id") or subj.get("subjectId"))
         subj_name = subj.get("subject") or subj.get("name") or subj.get("title") or "Unnamed Subject"
         
         if not subj_id:
             continue
 
-        # Short key in DATA_STORE
         key = store_data({
             "act": "subj",
             "bid": batch_id,
@@ -284,7 +305,7 @@ async def process_batch_id(message_or_query, batch_id: str, is_edit: bool = Fals
         await message_or_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
 
 # -----------------------------------------------------------------------------
-# 7. CALLBACK QUERY ROUTER (STEP 2 TO STEP 5)
+# 7. CALLBACK QUERY ROUTER
 # -----------------------------------------------------------------------------
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main callback router for inline keyboard interactions."""
@@ -326,23 +347,22 @@ async def show_topics(query, ctx_data: Dict[str, Any]):
 
     topics = await fetch_subject_topics(batch_id, subject_id)
 
+    # Fallback: if no specific sub-topics found, create an "All Topics / Chapters" fallback entry
     if not topics:
-        back_key = store_data({"act": "back_subj", "bid": batch_id})
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Subjects", callback_data=back_key)]])
-        await query.edit_message_text(
-            f"❌ <b>No topics found for subject:</b> {subject_name}",
-            reply_markup=markup,
-            parse_mode="HTML"
-        )
-        return
+        logger.info(f"No sub-topics returned from API for subject {subject_name}. Injecting fallback topic.")
+        topics = [{
+            "_id": subject_id,
+            "name": f"📁 All {subject_name} Chapters & Lectures",
+            "tagId": subject_id
+        }]
 
     keyboard = []
     for topic in topics:
-        top_id = str(topic.get("_id") or topic.get("id") or topic.get("tagId") or "")
-        top_name = topic.get("name") or topic.get("title") or topic.get("topic") or "Unnamed Topic"
+        top_id = extract_clean_id(topic.get("_id") or topic.get("id") or topic.get("tagId") or topic.get("topicId") or subject_id)
+        top_name = topic.get("name") or topic.get("title") or topic.get("topic") or topic.get("chapterName") or "Unnamed Topic"
         
         if not top_id:
-            continue
+            top_id = subject_id
 
         key = store_data({
             "act": "top",
@@ -372,13 +392,11 @@ async def show_content_tabs(query, ctx_data: Dict[str, Any]):
     topic_id = ctx_data["tid"]
     topic_name = ctx_data["tname"]
 
-    # 4 Content Tabs Buttons
     key_vids = store_data({**ctx_data, "act": "cnt", "ctype": "videos"})
     key_notes = store_data({**ctx_data, "act": "cnt", "ctype": "notes"})
     key_dpp_n = store_data({**ctx_data, "act": "cnt", "ctype": "dpp_notes"})
     key_dpp_s = store_data({**ctx_data, "act": "cnt", "ctype": "dpp_solutions"})
 
-    # Back button to Topics
     key_back = store_data({"act": "subj", "bid": batch_id, "sid": subject_id, "sname": subject_name})
 
     keyboard = [
@@ -404,6 +422,56 @@ async def show_content_tabs(query, ctx_data: Dict[str, Any]):
 # -----------------------------------------------------------------------------
 # STEP 4: CONTENT LISTING (VIDEOS & NOTES)
 # -----------------------------------------------------------------------------
+def extract_pdf_url(item: Dict[str, Any]) -> str:
+    """Extracts PDF document URL from item object."""
+    if not isinstance(item, dict):
+        return ""
+    
+    attachment = item.get("attachment") or item.get("file") or item.get("pdf")
+    if isinstance(attachment, dict):
+        base = attachment.get("baseUrl") or ""
+        key = attachment.get("key") or attachment.get("url") or ""
+        if base and key:
+            return f"{base}{key}"
+        if key.startswith("http"):
+            return key
+
+    for field in ("attachmentUrl", "pdfUrl", "url", "fileUrl", "documentUrl", "downloadUrl"):
+        val = item.get(field)
+        if val and isinstance(val, str) and val.startswith("http"):
+            return val.strip()
+
+    hw_list = item.get("homeworkIds") or item.get("homework")
+    if isinstance(hw_list, list) and len(hw_list) > 0:
+        hw = hw_list[0]
+        if isinstance(hw, dict):
+            return extract_pdf_url(hw)
+
+    return ""
+
+def extract_video_id(item: Dict[str, Any]) -> str:
+    """Extracts Video ID for Telegram deep-linking."""
+    if not isinstance(item, dict):
+        return ""
+    
+    v_id = extract_clean_id(item.get("videoId") or item.get("_id") or item.get("id"))
+    if v_id and len(v_id) >= 5 and not v_id.startswith("http"):
+        return v_id
+
+    v_obj = item.get("videoDetails") or item.get("video")
+    if isinstance(v_obj, dict):
+        v_id = extract_clean_id(v_obj.get("_id") or v_obj.get("id") or v_obj.get("videoId"))
+        if v_id:
+            return v_id
+
+    url_val = item.get("url") or item.get("videoUrl") or ""
+    if isinstance(url_val, str) and url_val:
+        match = re.search(r'([a-f0-9]{24}|[a-zA-Z0-9_-]{10,})', url_val)
+        if match:
+            return match.group(1)
+
+    return extract_clean_id(item.get("_id"))
+
 async def show_contents_list(query, ctx_data: Dict[str, Any]):
     batch_id = ctx_data["bid"]
     subject_id = ctx_data["sid"]
@@ -444,37 +512,20 @@ async def show_contents_list(query, ctx_data: Dict[str, Any]):
 
     keyboard = []
 
-    # Handle Notes / DPP Notes vs Lectures / DPP Solutions
     if ctype in ("notes", "dpp_notes"):
         for item in contents:
             title = item.get("topic") or item.get("title") or item.get("name") or "PDF Document"
-            pdf_url = (
-                item.get("attachmentUrl")
-                or item.get("url")
-                or item.get("pdfUrl")
-                or item.get("file")
-                or item.get("documentUrl")
-            )
-            
-            if not pdf_url and isinstance(item.get("homeworkIds"), list) and len(item["homeworkIds"]) > 0:
-                hw = item["homeworkIds"][0]
-                if isinstance(hw, dict):
-                    pdf_url = hw.get("attachmentUrl") or hw.get("url")
+            pdf_url = extract_pdf_url(item)
 
-            if pdf_url and str(pdf_url).startswith("http"):
-                keyboard.append([InlineKeyboardButton(f"📄 {title}", url=str(pdf_url))])
+            if pdf_url:
+                keyboard.append([InlineKeyboardButton(f"📄 {title}", url=pdf_url)])
             else:
                 keyboard.append([InlineKeyboardButton(f"📄 {title} (URL Unavailable)", callback_data=back_key)])
 
     else:
         for item in contents:
             title = item.get("topic") or item.get("title") or item.get("name") or "Lecture Video"
-            video_id = str(
-                item.get("_id")
-                or item.get("id")
-                or item.get("videoId")
-                or (item.get("videoDetails", {}).get("_id") if isinstance(item.get("videoDetails"), dict) else "")
-            )
+            video_id = extract_video_id(item)
 
             if not video_id:
                 continue
@@ -487,7 +538,6 @@ async def show_contents_list(query, ctx_data: Dict[str, Any]):
             })
             keyboard.append([InlineKeyboardButton(f"▶️ {title}", callback_data=vid_key)])
 
-    # Back to Content Tabs
     keyboard.append([InlineKeyboardButton("🔙 Back to Content Tabs", callback_data=back_key)])
 
     markup = InlineKeyboardMarkup(keyboard)
@@ -511,10 +561,8 @@ async def show_video_details(query, ctx_data: Dict[str, Any]):
     video_name = ctx_data["vname"]
     ctype = ctx_data.get("ctype", "videos")
 
-    # Generate Telegram bot deep-link URL strictly as requested
     deeplink_url = f"https://t.me/AS_MultiverseRoBot?start={batch_id}_{video_id}"
 
-    # Back button to contents list
     back_key = store_data({
         "act": "cnt",
         "bid": batch_id,
