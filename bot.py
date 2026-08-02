@@ -74,7 +74,7 @@ def extract_clean_id(obj: Any) -> str:
     if isinstance(obj, str):
         return obj.strip()
     if isinstance(obj, dict):
-        for k in ("_id", "id", "subjectId", "tagId", "topicId", "videoId"):
+        for k in ("_id", "id", "videoId", "subjectId", "tagId", "topicId"):
             if obj.get(k):
                 return extract_clean_id(obj[k])
     return str(obj).strip()
@@ -88,36 +88,57 @@ PENPENCIL_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-def extract_list(data: Any, target_keys=("topics", "batchTopics", "subjectTopics", "chapters", "subjects", "batchSubject", "contents", "lectures", "notes", "dpp", "data", "result", "items")) -> List[Dict[str, Any]]:
+def extract_list(data: Any, target_keys=None) -> List[Dict[str, Any]]:
     """
     Recursively inspects nested PenPencil API JSON structures and extracts array lists.
+    Prioritizes specific content arrays over generic keys and flattens wrapped lists.
     """
     if not data:
         return []
+
+    if target_keys is None:
+        target_keys = (
+            "contents", "lectures", "videos", "notes", "dpp", "dppNotes", "dppSolutions",
+            "topics", "batchTopics", "subjectTopics", "chapters",
+            "subjects", "batchSubject",
+            "data", "result", "items"
+        )
+
     if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
+        items = [item for item in data if isinstance(item, dict)]
+        flattened = []
+        for item in items:
+            inner_found = False
+            for inner_key in ("contents", "lectures", "videos", "notes", "dpp", "items"):
+                val = item.get(inner_key)
+                if isinstance(val, list) and len(val) > 0:
+                    flattened.extend([x for x in val if isinstance(x, dict)])
+                    inner_found = True
+                    break
+            if not inner_found:
+                flattened.append(item)
+        return flattened
+
     if isinstance(data, dict):
-        # 1. Check preferred target keys
+        # 1. Check target keys in priority order
         for key in target_keys:
             val = data.get(key)
             if isinstance(val, list) and len(val) > 0:
-                return [item for item in val if isinstance(item, dict)]
+                res = extract_list(val, target_keys)
+                if res:
+                    return res
             elif isinstance(val, dict):
                 sub_res = extract_list(val, target_keys)
                 if sub_res:
                     return sub_res
 
-        # 2. Match any array containing dicts
+        # 2. Recurse into nested dicts
         for k, v in data.items():
-            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
-                return v
-
-        # 3. Recurse into nested dicts
-        for k, v in data.items():
-            if isinstance(v, dict):
+            if isinstance(v, (dict, list)):
                 res = extract_list(v, target_keys)
                 if res:
                     return res
+
     return []
 
 # -----------------------------------------------------------------------------
@@ -152,7 +173,7 @@ async def fetch_batch_subjects(batch_id: str) -> List[Dict[str, Any]]:
         f"https://api.penpencil.co/v2/batches/{batch_id}/subject",
     ]
     raw_response = await fetch_api_with_fallbacks(endpoints)
-    return extract_list(raw_response, target_keys=("subjects", "batchSubject", "data", "result"))
+    return extract_list(raw_response)
 
 async def fetch_subject_topics(batch_id: str, subject_id: str, page: int = 1) -> List[Dict[str, Any]]:
     """Fetch topics/chapters for a subject using comprehensive fallback endpoints."""
@@ -191,7 +212,7 @@ async def fetch_topic_contents(batch_id: str, subject_id: str, tag_id: str, cont
         f"https://api.penpencil.co/v3/batches/{batch_id}/subject/{subject_id}/contents?tag={tag_id}&contentType={type_param}",
     ]
     raw_response = await fetch_api_with_fallbacks(endpoints)
-    return extract_list(raw_response, target_keys=("contents", "lectures", "notes", "dpp", "data", "result", "items"))
+    return extract_list(raw_response, target_keys=("contents", "lectures", "videos", "notes", "dpp", "data", "result", "items"))
 
 # -----------------------------------------------------------------------------
 # 5. COMMAND & MESSAGE HANDLERS
@@ -347,7 +368,7 @@ async def show_topics(query, ctx_data: Dict[str, Any]):
 
     topics = await fetch_subject_topics(batch_id, subject_id)
 
-    # Fallback: if no specific sub-topics found, create an "All Topics / Chapters" fallback entry
+    # Fallback: if no specific sub-topics found, create an "All Chapters & Lectures" fallback entry
     if not topics:
         logger.info(f"No sub-topics returned from API for subject {subject_name}. Injecting fallback topic.")
         topics = [{
@@ -450,27 +471,48 @@ def extract_pdf_url(item: Dict[str, Any]) -> str:
     return ""
 
 def extract_video_id(item: Dict[str, Any]) -> str:
-    """Extracts Video ID for Telegram deep-linking."""
+    """Extracts unique Video ID for Telegram deep-linking."""
     if not isinstance(item, dict):
         return ""
-    
-    v_id = extract_clean_id(item.get("videoId") or item.get("_id") or item.get("id"))
-    if v_id and len(v_id) >= 5 and not v_id.startswith("http"):
-        return v_id
 
-    v_obj = item.get("videoDetails") or item.get("video")
-    if isinstance(v_obj, dict):
-        v_id = extract_clean_id(v_obj.get("_id") or v_obj.get("id") or v_obj.get("videoId"))
-        if v_id:
-            return v_id
+    # 1. Check direct videoId field
+    v_id = item.get("videoId")
+    if isinstance(v_id, str) and v_id.strip() and not v_id.startswith("http"):
+        return v_id.strip()
+    elif isinstance(v_id, dict):
+        clean = extract_clean_id(v_id.get("_id") or v_id.get("id") or v_id.get("videoId"))
+        if clean and not clean.startswith("http"):
+            return clean
 
-    url_val = item.get("url") or item.get("videoUrl") or ""
-    if isinstance(url_val, str) and url_val:
-        match = re.search(r'([a-f0-9]{24}|[a-zA-Z0-9_-]{10,})', url_val)
-        if match:
-            return match.group(1)
+    # 2. Check videoDetails or video nested object
+    for v_key in ("videoDetails", "video", "lecture", "content"):
+        v_obj = item.get(v_key)
+        if isinstance(v_obj, dict):
+            clean = extract_clean_id(v_obj.get("_id") or v_obj.get("id") or v_obj.get("videoId") or v_obj.get("externalId"))
+            if clean and not clean.startswith("http"):
+                return clean
+        elif isinstance(v_obj, str) and v_obj.strip() and not v_obj.startswith("http"):
+            return v_obj.strip()
 
-    return extract_clean_id(item.get("_id"))
+    # 3. Check externalId
+    ext_id = item.get("externalId")
+    if isinstance(ext_id, str) and ext_id.strip() and not ext_id.startswith("http"):
+        return ext_id.strip()
+
+    # 4. Check primary _id or id
+    pri_id = item.get("_id") or item.get("id")
+    if isinstance(pri_id, str) and pri_id.strip() and not pri_id.startswith("http"):
+        return pri_id.strip()
+
+    # 5. Regex search in URLs
+    for url_key in ("url", "videoUrl", "embedUrl", "streamUrl", "link"):
+        url_val = item.get(url_key)
+        if isinstance(url_val, str) and url_val:
+            match = re.search(r'([a-f0-9]{24}|[a-zA-Z0-9_-]{10,})', url_val)
+            if match:
+                return match.group(1)
+
+    return ""
 
 async def show_contents_list(query, ctx_data: Dict[str, Any]):
     batch_id = ctx_data["bid"]
@@ -523,8 +565,8 @@ async def show_contents_list(query, ctx_data: Dict[str, Any]):
                 keyboard.append([InlineKeyboardButton(f"📄 {title} (URL Unavailable)", callback_data=back_key)])
 
     else:
-        for item in contents:
-            title = item.get("topic") or item.get("title") or item.get("name") or "Lecture Video"
+        for idx, item in enumerate(contents, start=1):
+            title = item.get("topic") or item.get("title") or item.get("name") or f"Lecture Video {idx}"
             video_id = extract_video_id(item)
 
             if not video_id:
